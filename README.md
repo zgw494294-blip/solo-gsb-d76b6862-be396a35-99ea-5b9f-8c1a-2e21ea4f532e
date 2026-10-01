@@ -24,6 +24,15 @@
 过期返回 **409**。历史保存在本地 SQLite（Docker 下位于命名卷），容器重启后
 仍可读取。
 
+此外还提供一个**只读的撤防预演**接口
+（`POST /api/histories/{id}/retract-preview`）：给出一条已存事件的
+`replica_id`、`seq`，预演**如果**撤除它会波及哪些写入与 key 裁决，但
+**不实际删除任何数据**。预演会连带撤除目标事件以及所有直接或间接依赖它的
+事件（同副本后继、以及时钟分量指向被撤事件的事件，跨 key 也计入），保留
+因果无关的并发事件；返回被撤事件、剩余原格式事件（不重编号、不改时钟），
+以及每个裁决结构发生变化的 key 的前后裁决（某 key 无剩余事件时后裁决为
+`null`，与 `deleted` 不同）。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -50,6 +59,7 @@ docker compose down
 | 读取历史（批次+裁决） | `GET http://localhost:8000/api/histories/{id}` |
 | 汇入离线事件 | `POST http://localhost:8000/api/histories/{id}/events` |
 | 提交冲突处理 | `POST http://localhost:8000/api/histories/{id}/resolve-conflict` |
+| 撤防预演（只读） | `POST http://localhost:8000/api/histories/{id}/retract-preview` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -511,6 +521,7 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 | `GET` | `/api/histories/{id}` | 读取完整原格式批次（事件按 `replica_id`、`seq` 排序）及原裁决，二者来自同一已提交状态 |
 | `POST` | `/api/histories/{id}/events` | 按 ID 汇入一批事件（请求体只有 `events`） |
 | `POST` | `/api/histories/{id}/resolve-conflict` | 按 ID 提交原冲突处理参数（`key`、`replica_id`、`versions`、`put`/`delete`），不再传整个批次 |
+| `POST` | `/api/histories/{id}/retract-preview` | **只读预演**：撤除一条事件会波及哪些事件和 key 裁决，不落库、不删除 |
 
 汇入规则：
 
@@ -739,6 +750,234 @@ curl -sS http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f
 ```
 
 如需连数据一起清除：`docker compose down -v`。
+
+## 撤防预演接口 `POST /api/histories/{id}/retract-preview`
+
+**只读**预演撤除一条离线事件的影响：服务端只对当前已提交历史做一次快照
+读取并在内存中计算，**不写库、不删除、不占用或重编任何序号与时钟**，旧接口
+与原库内容完全不变。
+
+请求体只标识目标事件：
+
+```json
+{"replica_id": "r1", "seq": 1}
+```
+
+约束：`replica_id` 为非空字符串；`seq` 为 `>= 1` 的整数（不接受数字字符串）；
+请求体不允许多余字段。参数非法返回 **422**；历史不存在返回 **404**
+（`history_not_found`），历史存在但没有该 `(replica_id, seq)` 事件（包括
+`replica_id` 不属于本历史）也返回 **404**（`event_not_found`）。
+
+波及范围按依赖闭包计算，与无状态校验里的因果引用完全一致：
+
+- 一条事件的直接依赖是其**本副本上一事件**（`seq - 1`，若存在）以及时钟中
+  其他副本**非零分量**指向的事件（分量 `0` 表示不知道该副本的任何事件，
+  不构成依赖）；
+- 被撤除的是目标事件**以及所有直接或间接依赖它的事件**——依赖边跨 key
+  生效，因此在别的 key 上、但因果上建立在被撤事件之上的写入也会被撤；
+- 因果无关的并发事件（与目标互不可比）**保留**；
+- 剩余事件保持原 `seq` 与原 `clock` 原样返回，不做任何重编号或时钟修补。
+
+响应：
+
+- `removed`：被撤事件的 `replica_id`、`seq`，按二者排序；
+- `remaining_events`：剩余事件的**原线格式**（与创建/汇入时一致，
+  `put`/`delete` 二选一），按 `replica_id`、`seq` 排序；全部撤空时为 `[]`，
+  接口仍返回 **200**；
+- `changed_keys`：按 key 排序，每项含 `key`、`before`、`after`；只有按
+  **完整原裁决结构**比较确实发生变化的 key 才出现（裁决形状同
+  `/api/resolve` 的单条结果：`put` / `deleted` / `conflict`）。某 key 已无
+  剩余事件时 `after` 为 `null`——这与 `state: "deleted"`（仍有一条存活的
+  delete 事件）是两回事；事件被撤但裁决不变的 key 不会出现。
+
+### 16. 创建历史、预演撤防、再读取确认未改动
+
+下面这份历史中：`r1/1`（key `a`）← `r2/1`（key `b`，时钟知道 `r1/1`，
+**跨 key**）← `r1/2`（key `c`）← `r2/2`（key `a` 的 delete，知道 `r1/2`）；
+另有 `r3/1`（key `z`）是与它们完全并发的无关分支。
+
+先创建历史并拿到返回的 ID：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2", "r3"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "a", "put": "a0",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "b", "put": "b0",
+       "clock": {"r1": 1, "r2": 1, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "c", "put": "c0",
+       "clock": {"r1": 2, "r2": 1, "r3": 0}},
+      {"replica_id": "r2", "seq": 2, "key": "a", "delete": "delete",
+       "clock": {"r1": 2, "r2": 2, "r3": 0}},
+      {"replica_id": "r3", "seq": 1, "key": "z", "put": "z",
+       "clock": {"r1": 0, "r2": 0, "r3": 1}}
+    ]
+  }'
+```
+
+```json
+{ "id": "f82cdf528c99461c9a6becef9edddd1f" }
+```
+
+用创建返回的 ID 预演撤除 `r1/1`（下面用 shell 变量复用该 ID）：
+
+```bash
+HID=f82cdf528c99461c9a6becef9edddd1f
+
+curl -sS -X POST http://localhost:8000/api/histories/$HID/retract-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "seq": 1}'
+```
+
+依赖闭包跨 key 级联：`r1/1` →（同副本后继）`r1/2`，以及时钟指向被撤事件的
+`r2/1`（知道 `r1/1`）与 `r2/2`（知道 `r1/2`、并继随 `r2/1`）；并发的
+`r3/1` 保留。三个被清空的 key 的后裁决为 `null`（其中 `a` 原裁决是
+`deleted`，撤空后是 `null`，二者不同）；`z` 裁决未变故不出现：
+
+```json
+{
+  "id": "f82cdf528c99461c9a6becef9edddd1f",
+  "removed": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 1},
+    {"replica_id": "r2", "seq": 2}
+  ],
+  "remaining_events": [
+    {"replica_id": "r3", "seq": 1, "key": "z", "put": "z",
+     "clock": {"r1": 0, "r2": 0, "r3": 1}}
+  ],
+  "changed_keys": [
+    {
+      "key": "a",
+      "before": {"key": "a", "state": "deleted",
+                 "event": {"replica_id": "r2", "seq": 2, "op": "delete",
+                           "value": null,
+                           "clock": {"r1": 2, "r2": 2, "r3": 0}}},
+      "after": null
+    },
+    {
+      "key": "b",
+      "before": {"key": "b", "state": "put", "value": "b0",
+                 "event": {"replica_id": "r2", "seq": 1, "op": "put",
+                           "value": "b0",
+                           "clock": {"r1": 1, "r2": 1, "r3": 0}}},
+      "after": null
+    },
+    {
+      "key": "c",
+      "before": {"key": "c", "state": "put", "value": "c0",
+                 "event": {"replica_id": "r1", "seq": 2, "op": "put",
+                           "value": "c0",
+                           "clock": {"r1": 2, "r2": 1, "r3": 0}}},
+      "after": null
+    }
+  ]
+}
+```
+
+再读取同一历史，确认五条事件原样还在——预演没有改动任何数据：
+
+```bash
+curl -sS http://localhost:8000/api/histories/$HID
+```
+
+```json
+{
+  "id": "f82cdf528c99461c9a6becef9edddd1f",
+  "replica_ids": ["r1", "r2", "r3"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "a", "put": "a0",
+     "clock": {"r1": 1, "r2": 0, "r3": 0}},
+    {"replica_id": "r1", "seq": 2, "key": "c", "put": "c0",
+     "clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "b", "put": "b0",
+     "clock": {"r1": 1, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 2, "key": "a", "delete": "delete",
+     "clock": {"r1": 2, "r2": 2, "r3": 0}},
+    {"replica_id": "r3", "seq": 1, "key": "z", "put": "z",
+     "clock": {"r1": 0, "r2": 0, "r3": 1}}
+  ],
+  "results": [ "...", "（与创建后的裁决完全一致）" ]
+}
+```
+
+### 17. 预演的其他结果形态
+
+撤防一条并发分支时，只有同副本后继被撤，因果无关的并发事件保留、原序号不变；
+key 可能只是裁决转移而非清空：
+
+```bash
+# r1/1 与 r2/1 并发冲突，r1/2 支配二者；撤除 r1/1 连带撤 r1/2，
+# r2 分支（时钟 r1=0，与 r1 分支无关）保留，name 的裁决转为 r2/1。
+curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+       "clock": {"r1": 0, "r2": 1}},
+      {"replica_id": "r1", "seq": 2, "key": "name", "put": "chosen",
+       "clock": {"r1": 2, "r2": 1}}
+    ]
+  }'
+
+curl -sS -X POST http://localhost:8000/api/histories/$HID/retract-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r1", "seq": 1}'
+```
+
+```json
+{
+  "id": "...",
+  "removed": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2}
+  ],
+  "remaining_events": [
+    {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+     "clock": {"r1": 0, "r2": 1}}
+  ],
+  "changed_keys": [
+    {
+      "key": "name",
+      "before": {"key": "name", "state": "put", "value": "chosen",
+                 "event": {"replica_id": "r1", "seq": 2, "op": "put",
+                           "value": "chosen", "clock": {"r1": 2, "r2": 1}}},
+      "after": {"key": "name", "state": "put", "value": "bob",
+                "event": {"replica_id": "r2", "seq": 1, "op": "put",
+                          "value": "bob", "clock": {"r1": 0, "r2": 1}}}
+    }
+  ]
+}
+```
+
+撤除一条经 `/resolve-conflict` 提交的冲突消解事件时，被遮蔽的冲突会在预演中
+**重新出现**（`after.state` 回到 `conflict`）；唯一一条事件被撤时历史全部
+撤空，仍返回 **200**，`remaining_events` 为 `[]`，对应 key 的 `after` 为
+`null`。
+
+错误情况：
+
+```bash
+# 历史不存在 -> 404 history_not_found
+curl -sS -i -X POST http://localhost:8000/api/histories/00000000000000000000000000000000/retract-preview \
+  -H 'Content-Type: application/json' -d '{"replica_id": "r1", "seq": 1}'
+
+# 历史存在但该事件不存在（含 replica_id 不属于本历史）-> 404 event_not_found
+curl -sS -i -X POST http://localhost:8000/api/histories/$HID/retract-preview \
+  -H 'Content-Type: application/json' -d '{"replica_id": "r1", "seq": 99}'
+
+# 参数非法（seq 为 0）-> 422；seq 传字符串、replica_id 为空、缺字段、
+# 多余字段同样返回 422
+curl -sS -i -X POST http://localhost:8000/api/histories/$HID/retract-preview \
+  -H 'Content-Type: application/json' -d '{"replica_id": "r1", "seq": 0}'
+```
 
 ## 本地开发（不使用 Docker）
 

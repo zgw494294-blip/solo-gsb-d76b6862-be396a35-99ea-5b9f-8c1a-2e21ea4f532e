@@ -1084,6 +1084,13 @@ def hist_commit(hid, key, writer, versions, **ops):
     )
 
 
+def hist_retract_preview(hid, replica, seq):
+    return client.post(
+        f"/api/histories/{hid}/retract-preview",
+        json={"replica_id": replica, "seq": seq},
+    )
+
+
 def create_conflict_history():
     r = hist_create(["r1", "r2"], two_branch_conflict())
     assert r.status_code == 201, r.text
@@ -1682,4 +1689,271 @@ print('ok')
     )
     assert read.returncode == 0, read.stderr
     assert read.stdout.strip() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Retraction preview (/api/histories/{id}/retract-preview, read-only)
+# ---------------------------------------------------------------------------
+
+
+# r1/1 (key a) <- r2/1 (key b, knows r1/1) <- r1/2 (key c) <- r2/2 (key a,
+# delete, knows r1/2); r3/1 (key z) is a fully independent concurrent branch.
+RETRACT_EVENTS = [
+    ev("r1", 1, "a", put="a0", clock={"r1": 1, "r2": 0, "r3": 0}),
+    ev("r2", 1, "b", put="b0", clock={"r1": 1, "r2": 1, "r3": 0}),
+    ev("r1", 2, "c", put="c0", clock={"r1": 2, "r2": 1, "r3": 0}),
+    ev("r2", 2, "a", delete="delete", clock={"r1": 2, "r2": 2, "r3": 0}),
+    ev("r3", 1, "z", put="z", clock={"r1": 0, "r2": 0, "r3": 1}),
+]
+RETRACT_REPLICAS = ["r1", "r2", "r3"]
+
+
+def create_retract_history():
+    r = hist_create(RETRACT_REPLICAS, RETRACT_EVENTS)
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_retract_preview_cascades_across_keys_and_replicas():
+    hid = create_retract_history()
+
+    r = hist_retract_preview(hid, "r1", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id"] == hid
+    # Target + every direct/transitive dependent, sorted by replica then seq.
+    assert data["removed"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 1},
+        {"replica_id": "r2", "seq": 2},
+    ]
+    # The independent concurrent branch survives, original format and order.
+    assert [(e["replica_id"], e["seq"]) for e in data["remaining_events"]] == [
+        ("r3", 1)
+    ]
+    survivor = data["remaining_events"][0]
+    assert survivor["key"] == "z" and survivor["put"] == "z"
+    # Clocks are not renumbered/rewritten.
+    assert survivor["clock"] == {"r1": 0, "r2": 0, "r3": 1}
+    # Changed keys sorted; a/b/c all lose every event -> after null.
+    assert [k["key"] for k in data["changed_keys"]] == ["a", "b", "c"]
+    for key, state in (("a", "deleted"), ("b", "put"), ("c", "put")):
+        change = next(k for k in data["changed_keys"] if k["key"] == key)
+        assert change["before"]["state"] == state
+        assert change["after"] is None  # null, not a 'deleted' verdict
+    # z's verdict is unchanged, so it is absent from changed_keys.
+    assert all(k["key"] != "z" for k in data["changed_keys"])
+
+
+def test_retract_preview_is_read_only():
+    hid = create_retract_history()
+    before = hist_get(hid).json()
+
+    assert hist_retract_preview(hid, "r1", 1).status_code == 200
+    # Multiple previews, including 404/422 responses, change nothing.
+    assert hist_retract_preview(hid, "r1", 99).status_code == 404
+    assert hist_retract_preview(hid, "r9", 1).status_code == 404
+    assert client.post(
+        f"/api/histories/{hid}/retract-preview",
+        json={"replica_id": "r1", "seq": 0},
+    ).status_code == 422
+
+    after = hist_get(hid).json()
+    assert after == before
+    assert len(after["events"]) == 5
+
+
+def test_retract_preview_independent_leaf_only_removes_itself():
+    hid = create_retract_history()
+
+    r = hist_retract_preview(hid, "r3", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["removed"] == [{"replica_id": "r3", "seq": 1}]
+    assert [(e["replica_id"], e["seq"]) for e in data["remaining_events"]] == [
+        ("r1", 1), ("r1", 2), ("r2", 1), ("r2", 2),
+    ]
+    assert [k["key"] for k in data["changed_keys"]] == ["z"]
+    (change,) = data["changed_keys"]
+    assert change["before"]["state"] == "put"
+    assert change["before"]["value"] == "z"
+    assert change["after"] is None
+
+
+def test_retract_preview_retracting_only_event_empties_history_but_returns_200():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="v", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+
+    r = hist_retract_preview(hid, "r1", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["removed"] == [{"replica_id": "r1", "seq": 1}]
+    assert data["remaining_events"] == []
+    assert data["changed_keys"] == [
+        {
+            "key": "k",
+            "before": {
+                "key": "k",
+                "state": "put",
+                "value": "v",
+                "event": {
+                    "replica_id": "r1",
+                    "seq": 1,
+                    "op": "put",
+                    "value": "v",
+                    "clock": {"r1": 1, "r2": 0},
+                },
+            },
+            "after": None,
+        }
+    ]
+    # The store itself still holds the event.
+    assert len(hist_get(hid).json()["events"]) == 1
+
+
+def test_retract_preview_concurrent_branch_is_retained_and_verdict_shifts():
+    # r1/1 and r2/1 conflict on name; r1/2 dominates both; r2/2 on another
+    # key depends only on r2/1.  Retracting r1/1 removes r1/2 only: the r2
+    # branch is causally independent (its clock has r1=0) and must survive.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "name", put="bob", clock={"r1": 0, "r2": 1}),
+            ev("r1", 2, "name", put="chosen", clock={"r1": 2, "r2": 1}),
+            ev("r2", 2, "note", put="x", clock={"r1": 0, "r2": 2}),
+        ],
+    ).json()["id"]
+
+    r = hist_retract_preview(hid, "r1", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["removed"] == [
+        {"replica_id": "r1", "seq": 1},
+        {"replica_id": "r1", "seq": 2},
+    ]
+    # Surviving seqs are NOT renumbered: r2/2 stays seq 2 with its clock.
+    assert data["remaining_events"] == [
+        {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+         "clock": {"r1": 0, "r2": 1}},
+        {"replica_id": "r2", "seq": 2, "key": "note", "put": "x",
+         "clock": {"r1": 0, "r2": 2}},
+    ]
+    # name's verdict shifts to the surviving concurrent branch; note is
+    # unchanged and therefore absent.
+    assert [k["key"] for k in data["changed_keys"]] == ["name"]
+    change = data["changed_keys"][0]
+    assert change["before"]["state"] == "put"
+    assert change["before"]["value"] == "chosen"
+    assert change["after"] == {
+        "key": "name",
+        "state": "put",
+        "value": "bob",
+        "event": {"replica_id": "r2", "seq": 1, "op": "put", "value": "bob",
+                  "clock": {"r1": 0, "r2": 1}},
+    }
+
+
+def test_retract_preview_transitive_cross_key_cascade():
+    # Retracting r2/1 sweeps r2/2 (same-replica successor) and r1/2 (its
+    # clock points at r2/1), but leaves the concurrent r1/1.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "name", put="bob", clock={"r1": 0, "r2": 1}),
+            ev("r1", 2, "name", put="chosen", clock={"r1": 2, "r2": 1}),
+            ev("r2", 2, "note", put="x", clock={"r1": 0, "r2": 2}),
+        ],
+    ).json()["id"]
+
+    r = hist_retract_preview(hid, "r2", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["removed"] == [
+        {"replica_id": "r1", "seq": 2},
+        {"replica_id": "r2", "seq": 1},
+        {"replica_id": "r2", "seq": 2},
+    ]
+    assert [(e["replica_id"], e["seq"]) for e in data["remaining_events"]] == [
+        ("r1", 1)
+    ]
+    keys = {k["key"]: k for k in data["changed_keys"]}
+    assert sorted(keys) == ["name", "note"]
+    assert keys["note"]["after"] is None
+    assert keys["name"]["after"]["state"] == "put"
+    assert keys["name"]["after"]["value"] == "alice"
+
+
+def test_retract_preview_resurfaces_conflict_when_resolution_event_removed():
+    hid = create_conflict_history()
+    commit = hist_commit(
+        hid,
+        key="name",
+        writer="r1",
+        versions=[
+            {"replica_id": "r1", "seq": 1},
+            {"replica_id": "r2", "seq": 1},
+        ],
+        put="chosen",
+    )
+    assert commit.status_code == 200, commit.text
+
+    r = hist_retract_preview(hid, "r1", 2)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["removed"] == [{"replica_id": "r1", "seq": 2}]
+    assert [(e["replica_id"], e["seq"]) for e in data["remaining_events"]] == [
+        ("r1", 1), ("r2", 1)
+    ]
+    (change,) = data["changed_keys"]
+    assert change["key"] == "name"
+    assert change["before"]["state"] == "put"
+    assert change["before"]["value"] == "chosen"
+    assert change["after"]["state"] == "conflict"
+    assert [(e["replica_id"], e["seq"]) for e in change["after"]["events"]] == [
+        ("r1", 1), ("r2", 1)
+    ]
+
+
+def test_retract_preview_unknown_history_is_404():
+    r = hist_retract_preview("0" * 32, "r1", 1)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+
+def test_retract_preview_unknown_event_is_404_even_for_unknown_replica():
+    hid = create_retract_history()
+
+    r = hist_retract_preview(hid, "r1", 99)
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+    r = hist_retract_preview(hid, "r9", 1)
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+    # The failed previews wrote nothing.
+    got = hist_get(hid).json()
+    assert len(got["events"]) == 5
+
+
+def test_retract_preview_bad_parameters_are_422():
+    hid = create_retract_history()
+    base = f"/api/histories/{hid}/retract-preview"
+
+    assert client.post(base, json={"replica_id": "r1", "seq": 0}).status_code == 422
+    assert client.post(base, json={"replica_id": "r1", "seq": -1}).status_code == 422
+    # Strict integer: a numeric string is rejected, not coerced.
+    assert client.post(base, json={"replica_id": "r1", "seq": "1"}).status_code == 422
+    assert client.post(base, json={"replica_id": "", "seq": 1}).status_code == 422
+    assert client.post(base, json={"seq": 1}).status_code == 422
+    assert client.post(base, json={"replica_id": "r1"}).status_code == 422
+    assert client.post(base, json={}).status_code == 422
+    assert client.post(
+        base, json={"replica_id": "r1", "seq": 1, "extra": True}
+    ).status_code == 422
 

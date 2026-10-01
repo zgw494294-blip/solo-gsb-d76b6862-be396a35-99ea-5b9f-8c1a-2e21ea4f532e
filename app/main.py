@@ -28,6 +28,15 @@ by ID with only the original resolution parameters (key, writer, versions,
 op) -- the stored versions are re-checked at commit time and stale lists get
 409.  Histories live in a local SQLite database (HISTORY_DB_PATH, WAL) and
 therefore survive container restarts.
+
+A read-only retraction-preview endpoint (/retract-preview) takes an event's
+(replica_id, seq) and previews which writes and key verdicts a retraction
+would touch, without deleting anything: it computes the target plus the
+transitive closure of events that depend on it (same-replica successors and
+events whose clock components point at a removed event, across every key),
+then returns the removed identities, the surviving original-format events
+(original seqs and clocks untouched), and the before/after verdict of every
+key whose full verdict structure changes (null when no events remain).
 """
 
 from __future__ import annotations
@@ -220,6 +229,24 @@ class MergeEventsRequest(BaseModel):
     ]
 
 
+class RetractPreviewRequest(BaseModel):
+    """Identity of the offline event whose retraction is being previewed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    replica_id: Annotated[
+        str, Field(min_length=1, description="Replica that produced the event.")
+    ]
+    seq: Annotated[
+        int,
+        Field(
+            strict=True,
+            ge=1,
+            description="Per-replica sequence number of the event, starting at 1.",
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Error type
 # ---------------------------------------------------------------------------
@@ -247,6 +274,19 @@ class HistoryNotFound(Exception):
     def __init__(self, history_id: str):
         super().__init__(f"history {history_id!r} not found")
         self.history_id = history_id
+
+
+class HistoryEventNotFound(Exception):
+    """A stored history has no event with the referenced identity (HTTP 404)."""
+
+    def __init__(self, history_id: str, replica_id: str, seq: int):
+        super().__init__(
+            f"event replica_id={replica_id!r}, seq={seq} not found in history "
+            f"{history_id!r}"
+        )
+        self.history_id = history_id
+        self.replica_id = replica_id
+        self.seq = seq
 
 
 def _err(code: str, message: str, event_index: int | None = None) -> dict:
@@ -665,6 +705,110 @@ def resolve(events: list[Event], replica_ids: list[str]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Retraction preview (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _direct_dependencies(ev: Event) -> list[tuple[str, int]]:
+    """Identities an event directly declares as its causal history.
+
+    The immediately previous event on the same replica (``seq - 1``) plus, for
+    every other replica, the event its non-zero clock component points at.
+    This mirrors exactly the reference set used by ``validate_batch``; stored
+    histories are validated and contiguous, so every referenced identity
+    exists.
+    """
+
+    deps: list[tuple[str, int]] = []
+    if ev.seq > 1:
+        deps.append((ev.replica_id, ev.seq - 1))
+    for rid, n in ev.clock.items():
+        if rid != ev.replica_id and n > 0:
+            deps.append((rid, n))
+    return deps
+
+
+def _retraction_closure(
+    target: tuple[str, int], events: list[Event]
+) -> set[tuple[str, int]]:
+    """The target and every event that directly or transitively depends on it.
+
+    An event is swept in when it *is* the target or one of its declared
+    dependencies (its same-replica predecessor, or the event another
+    replica's non-zero clock component points at) is swept in.  Dependency
+    edges cross keys freely, so a write on another key that causally builds
+    on a removed event is removed too; causally independent concurrent events
+    are retained.
+    """
+
+    dependents: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    for ev in events:
+        for dep in _direct_dependencies(ev):
+            dependents.setdefault(dep, []).append((ev.replica_id, ev.seq))
+
+    removed = {target}
+    frontier = [target]
+    while frontier:
+        current = frontier.pop()
+        for child in dependents.get(current, ()):
+            if child not in removed:
+                removed.add(child)
+                frontier.append(child)
+    return removed
+
+
+def _retraction_preview(
+    history_id: str,
+    replica_ids: list[str],
+    events: list[Event],
+    replica_id: str,
+    seq: int,
+) -> dict:
+    """Preview retracting one event without modifying the stored history.
+
+    Both verdicts are computed from the same in-memory committed snapshot;
+    surviving events keep their original seqs and clocks (nothing is
+    renumbered).  A key whose events all disappear has a null after-verdict,
+    which is distinct from a ``deleted`` verdict (a surviving delete event).
+    """
+
+    target = (replica_id, seq)
+    if not any(
+        (ev.replica_id, ev.seq) == target for ev in events
+    ):
+        raise HistoryEventNotFound(history_id, replica_id, seq)
+
+    removed = _retraction_closure(target, events)
+    survivors = [
+        ev for ev in events if (ev.replica_id, ev.seq) not in removed
+    ]
+
+    before_by_key = {v["key"]: v for v in resolve(events, replica_ids)}
+    after_by_key = {v["key"]: v for v in resolve(survivors, replica_ids)}
+
+    changes: list[dict] = []
+    for key in sorted(before_by_key.keys() | after_by_key.keys()):
+        before = before_by_key.get(key)
+        after = after_by_key.get(key)
+        # Change is decided on the complete original verdict structure.
+        if before != after:
+            changes.append({"key": key, "before": before, "after": after})
+
+    return {
+        "id": history_id,
+        "removed": [
+            {"replica_id": rid, "seq": n}
+            for rid, n in sorted(removed)
+        ],
+        "remaining_events": [
+            _canonical_wire(ev, replica_ids)
+            for ev in sorted(survivors, key=lambda e: (e.replica_id, e.seq))
+        ],
+        "changed_keys": changes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Conflict resolution event
 # ---------------------------------------------------------------------------
 
@@ -1046,6 +1190,26 @@ async def history_not_found_handler(
     )
 
 
+@app.exception_handler(HistoryEventNotFound)
+async def history_event_not_found_handler(
+    request: Request, exc: HistoryEventNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "event_not_found",
+                    "message": (
+                        f"no event with replica_id {exc.replica_id!r}, seq "
+                        f"{exc.seq} exists in history {exc.history_id!r}"
+                    ),
+                }
+            ]
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
@@ -1216,3 +1380,35 @@ def commit_history_conflict(history_id: str, body: ConflictDecision) -> dict:
         )
         return {"id": hid, "event": _canonical_wire(new_event, replica_ids),
                 "result": verdict}
+
+
+@app.post(
+    "/api/histories/{history_id}/retract-preview",
+    tags=["histories"],
+    response_model=None,
+)
+def preview_history_retraction(
+    history_id: str, body: RetractPreviewRequest
+) -> dict:
+    """Preview (without deleting) the impact of retracting one stored event.
+
+    The preview removes the target event and every event that directly or
+    transitively depends on it -- the predecessor on its own replica and
+    events whose clock components point at a removed event, regardless of
+    key -- while causally independent concurrent events survive with their
+    original seqs and clocks.  The response lists the removed identities
+    (sorted by replica_id then seq), the remaining events in the original
+    wire format (same order), and the before/after verdict of every changed
+    key (sorted by key; a key with no surviving events has a null after
+    verdict, which is not the same as ``deleted``).  Nothing is written:
+    before and after are both computed from one committed snapshot read.
+    Unknown history or event identity -> 404; malformed parameters -> 422.
+    """
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    hid, replica_ids, events = _load_row(row)
+    return _retraction_preview(
+        hid, replica_ids, events, body.replica_id, body.seq
+    )
