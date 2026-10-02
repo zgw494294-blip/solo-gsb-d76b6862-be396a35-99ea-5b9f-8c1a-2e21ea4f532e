@@ -24,6 +24,11 @@
 过期返回 **409**。历史保存在本地 SQLite（Docker 下位于命名卷），容器重启后
 仍可读取。
 
+此外还有一个**只读的撤除预演**接口：给定已提交历史的 ID 与一条事件的
+`replica_id`、`seq`，预演把该离线事件撤除会波及哪些写入与 key——目标事件及
+所有直接或间接依赖它的事件（跨 key）都会计入，无关并发事件保留；只返回预演
+结果，**不实际删除、不重排序号或时钟、不改动已提交历史**。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -50,6 +55,7 @@ docker compose down
 | 读取历史（批次+裁决） | `GET http://localhost:8000/api/histories/{id}` |
 | 汇入离线事件 | `POST http://localhost:8000/api/histories/{id}/events` |
 | 提交冲突处理 | `POST http://localhost:8000/api/histories/{id}/resolve-conflict` |
+| 撤除预演（只读，不落任何写入） | `GET http://localhost:8000/api/histories/{id}/withdraw-preview?replica_id=r1&seq=1` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -511,6 +517,7 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 | `GET` | `/api/histories/{id}` | 读取完整原格式批次（事件按 `replica_id`、`seq` 排序）及原裁决，二者来自同一已提交状态 |
 | `POST` | `/api/histories/{id}/events` | 按 ID 汇入一批事件（请求体只有 `events`） |
 | `POST` | `/api/histories/{id}/resolve-conflict` | 按 ID 提交原冲突处理参数（`key`、`replica_id`、`versions`、`put`/`delete`），不再传整个批次 |
+| `GET` | `/api/histories/{id}/withdraw-preview?replica_id=...&seq=...` | **只读**预演撤除一条事件的波及范围（撤除集合、剩余事件、前后裁决），不改动历史 |
 
 汇入规则：
 
@@ -533,7 +540,9 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
   版本与写入副本历史，随后随整份历史一起原子写入；
 - 并发提交同一冲突时只有一个能成功，其余拿到 409，不会重复占用序号。
 
-不存在的 ID 在三个按 ID 访问的接口上都返回 **404**（`history_not_found`）。
+不存在的 ID 在四个按 ID 访问的接口上都返回 **404**（`history_not_found`）；
+撤除预演在历史存在但目标事件不存在（含 `replica_id` 不属于该历史）时另返回
+`event_not_found`，同样是 **404**。
 
 ### 10. 创建历史并获得 ID
 
@@ -739,6 +748,167 @@ curl -sS http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f
 ```
 
 如需连数据一起清除：`docker compose down -v`。
+
+## 撤除预演接口 `GET /api/histories/{id}/withdraw-preview`
+
+在**已提交的持久历史**上预演：如果撤除某一条离线事件，会连带波及哪些事件与
+key。接口为**只读**：不删除任何事件、不修改、不重排序号或时钟，前后结果取自
+同一次读取的同一已提交历史；旧接口与库中数据均不受影响。
+
+查询参数：
+
+- `replica_id`：目标事件所属副本（非空字符串）；
+- `seq`：目标事件在该副本的序号（正整数）。
+
+波及范围按与批次校验相同的**直接依赖边**反向闭包计算。一条事件的直接依赖是：
+
+- 本副本的上一事件（`seq - 1`，存在时）；
+- 时钟中**其他副本**的非零分量所指向的事件（分量为 `0` 表示不依赖该副本）。
+
+撤除集合 = 目标事件 + 所有直接或间接依赖它的事件，**跨 key 也计入**；
+与其无因果关系的**并发事件一律保留**（即使写的是同一个 key）。保留事件的
+`seq`、`clock` 原样不变，不做重编。
+
+响应：
+
+- `id`：历史 ID；
+- `withdrawn`：将被撤除事件的 `replica_id`、`seq`，按 `replica_id`、`seq`
+  排序（目标本身包含在内）；
+- `events`：剩余事件的**原线格式**（`put`/`delete` 二选一、原始 `clock`），
+  顺序仍按 `replica_id`、`seq`；
+- `changes`：裁决发生变化的 key，按 key 排序，每项含完整的前后裁决结构
+  `before`/`after`（形状与 `/api/resolve` 的单条结果一致，按完整结构判变）；
+  某 key 没有剩余事件时 `after` 为 `null`（表示该 key 无事件，**不等同于
+  `deleted`**）；裁决结构不变的 key 不出现在 `changes` 中。
+
+即使所有事件都被撤除，也返回 **200**，此时 `events` 为空数组。
+
+状态码：
+
+- **200**：预演完成（历史或 key 被完全撤空同样是 200）；
+- **404**：历史不存在（`history_not_found`），或历史存在但没有该
+  `replica_id`/`seq` 的事件（`event_not_found`，包括该 `replica_id` 不属于
+  本历史的副本集合）；
+- **422**：参数非法，如缺少/非数字/非正整数的 `seq`、空的 `replica_id`。
+
+### 16. 创建历史拿到 ID，预演撤除，再读取确认历史未改动
+
+先创建一份含三个副本、因果成链的历史：`r1/1` 写 `a`；`r2/1` 同步过 `r1/1`
+后写 `b`（时钟 `r1 = 1`）；`r1/2` 依赖本副本上一事件和 `r2/1`，删除 `a`；
+`r3/1` 完全离线并发写 `c`（各分量为 0），与前三者无因果关系。
+
+```bash
+curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2", "r3"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "a", "put": "x",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "b", "put": "y",
+       "clock": {"r1": 1, "r2": 1, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "a", "delete": "delete",
+       "clock": {"r1": 2, "r2": 1, "r3": 0}},
+      {"replica_id": "r3", "seq": 1, "key": "c", "put": "z",
+       "clock": {"r1": 0, "r2": 0, "r3": 1}}
+    ]
+  }'
+```
+
+```json
+{ "id": "0df8277d554f49629f627be82ea06322" }
+```
+
+用返回的 ID 预演撤除 `r1/1`（以下示例需要 `python3`；也可直接把上一步的 ID
+手工填入 URL）：
+
+```bash
+HID=0df8277d554f49629f627be82ea06322
+curl -sS -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
+  --data-urlencode 'replica_id=r1' \
+  --data-urlencode 'seq=1'
+```
+
+`r1/1`、依赖它的 `r2/1`、以及再依赖二者的 `r1/2` 全部计入撤除（跨 `a`、`b`
+两个 key）；无关并发的 `r3/1` 原样保留。`a`、`b` 无剩余事件，`after` 为
+`null`；`c` 的裁决不变，故不出现：
+
+```json
+{
+  "id": "0df8277d554f49629f627be82ea06322",
+  "withdrawn": [
+    {"replica_id": "r1", "seq": 1},
+    {"replica_id": "r1", "seq": 2},
+    {"replica_id": "r2", "seq": 1}
+  ],
+  "events": [
+    {"replica_id": "r3", "seq": 1, "key": "c", "put": "z",
+     "clock": {"r1": 0, "r2": 0, "r3": 1}}
+  ],
+  "changes": [
+    {
+      "key": "a",
+      "before": {
+        "key": "a", "state": "deleted",
+        "event": {"replica_id": "r1", "seq": 2, "op": "delete", "value": null,
+                  "clock": {"r1": 2, "r2": 1, "r3": 0}}
+      },
+      "after": null
+    },
+    {
+      "key": "b",
+      "before": {
+        "key": "b", "state": "put", "value": "y",
+        "event": {"replica_id": "r2", "seq": 1, "op": "put", "value": "y",
+                  "clock": {"r1": 1, "r2": 1, "r3": 0}}
+      },
+      "after": null
+    }
+  ]
+}
+```
+
+预演不落任何写入——再读一次历史，4 个事件、裁决均与预演前完全一致：
+
+```bash
+curl -sS "http://localhost:8000/api/histories/$HID"
+```
+
+```json
+{
+  "id": "0df8277d554f49629f627be82ea06322",
+  "replica_ids": ["r1", "r2", "r3"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "a", "put": "x",
+     "clock": {"r1": 1, "r2": 0, "r3": 0}},
+    {"replica_id": "r1", "seq": 2, "key": "a", "delete": "delete",
+     "clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "b", "put": "y",
+     "clock": {"r1": 1, "r2": 1, "r3": 0}},
+    {"replica_id": "r3", "seq": 1, "key": "c", "put": "z",
+     "clock": {"r1": 0, "r2": 0, "r3": 1}}
+  ],
+  "results": [ "……与创建时相同，未被修改……" ]
+}
+```
+
+并发分支的对照：同一历史预演撤除 `r3/1` 只会撤掉它自己，`a`、`b` 不受影响；
+若某 key 的两个极大事件互不可比（冲突），撤除其中一支只会让另一支成为唯一
+裁决，另一支**不会**进入 `withdrawn`。错误示例：
+
+```bash
+# 历史不存在 -> 404 history_not_found
+curl -sS -i -G "http://localhost:8000/api/histories/00000000000000000000000000000000/withdraw-preview" \
+  --data-urlencode 'replica_id=r1' --data-urlencode 'seq=1'
+
+# 事件不存在（r1 没有 seq 9）-> 404 event_not_found
+curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
+  --data-urlencode 'replica_id=r1' --data-urlencode 'seq=9'
+
+# seq 非正整数 -> 422
+curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
+  --data-urlencode 'replica_id=r1' --data-urlencode 'seq=0'
+```
 
 ## 本地开发（不使用 Docker）
 

@@ -1084,6 +1084,13 @@ def hist_commit(hid, key, writer, versions, **ops):
     )
 
 
+def hist_withdraw(hid, replica_id, seq):
+    return client.get(
+        f"/api/histories/{hid}/withdraw-preview",
+        params={"replica_id": replica_id, "seq": seq},
+    )
+
+
 def create_conflict_history():
     r = hist_create(["r1", "r2"], two_branch_conflict())
     assert r.status_code == 201, r.text
@@ -1683,3 +1690,242 @@ print('ok')
     assert read.returncode == 0, read.stderr
     assert read.stdout.strip() == "ok"
 
+
+
+# ---------------------------------------------------------------------------
+# Read-only withdrawal preview
+# ---------------------------------------------------------------------------
+
+
+def test_withdraw_preview_cascades_across_keys_and_keeps_concurrent_events():
+    # r1/1 (key a) -> r2/1 synced with it (key b) -> r1/2 (key a);
+    # r3/1 is a causally unrelated concurrent write on key c.
+    seed = [
+        ev("r1", 1, "a", put="x", clock={"r1": 1, "r2": 0, "r3": 0}),
+        ev("r2", 1, "b", put="y", clock={"r1": 1, "r2": 1, "r3": 0}),
+        ev("r1", 2, "a", delete="delete", clock={"r1": 2, "r2": 1, "r3": 0}),
+        ev("r3", 1, "c", put="z", clock={"r1": 0, "r2": 0, "r3": 1}),
+    ]
+    hid = hist_create(["r1", "r2", "r3"], seed).json()["id"]
+
+    r = hist_withdraw(hid, "r1", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id"] == hid
+    # Withdrawn identities sorted by (replica_id, seq): target plus its
+    # transitive dependents across both keys.
+    assert [(d["replica_id"], d["seq"]) for d in data["withdrawn"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r2", 1),
+    ]
+    # Remaining events keep original wire form and canonical order; no seq or
+    # clock is renumbered; the unrelated concurrent r3/1 survives untouched.
+    assert data["events"] == [
+        ev("r3", 1, "c", put="z", clock={"r1": 0, "r2": 0, "r3": 1})
+    ]
+    # Changes sorted by key, full verdict structures compared.
+    assert [ch["key"] for ch in data["changes"]] == ["a", "b"]
+    by_key = {ch["key"]: ch for ch in data["changes"]}
+    assert by_key["a"]["before"]["state"] == "deleted"
+    assert by_key["a"]["after"] is None
+    assert by_key["b"]["before"]["state"] == "put"
+    assert by_key["b"]["before"]["value"] == "y"
+    assert by_key["b"]["after"] is None
+    # Key c never appears: its verdict did not change.
+    assert "c" not in by_key
+
+
+def test_withdraw_preview_conflict_resolves_to_remaining_concurrent_branch():
+    seed = [
+        ev("r1", 1, "a", put="x", clock={"r1": 1, "r2": 0}),
+        ev("r2", 1, "a", put="y", clock={"r1": 0, "r2": 1}),
+        # Unrelated tail on r1: withdrawing r2/1 must not touch it.
+        ev("r1", 2, "b", put="z", clock={"r1": 2, "r2": 0}),
+    ]
+    hid = hist_create(["r1", "r2"], seed).json()["id"]
+
+    data = hist_withdraw(hid, "r2", 1).json()
+    assert [(d["replica_id"], d["seq"]) for d in data["withdrawn"]] == [
+        ("r2", 1)
+    ]
+    assert [(e["replica_id"], e["seq"]) for e in data["events"]] == [
+        ("r1", 1),
+        ("r1", 2),
+    ]
+    assert [ch["key"] for ch in data["changes"]] == ["a"]
+    change = data["changes"][0]
+    assert change["before"]["state"] == "conflict"
+    assert len(change["before"]["events"]) == 2
+    assert change["after"] == {
+        "key": "a",
+        "state": "put",
+        "value": "x",
+        "event": {
+            "replica_id": "r1",
+            "seq": 1,
+            "op": "put",
+            "value": "x",
+            "clock": {"r1": 1, "r2": 0},
+        },
+    }
+
+
+def test_withdraw_preview_removing_only_event_still_returns_200_empty_list():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "only", put="v", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+
+    r = hist_withdraw(hid, "r1", 1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["withdrawn"] == [{"replica_id": "r1", "seq": 1}]
+    assert data["events"] == []
+    assert len(data["changes"]) == 1
+    assert data["changes"][0]["key"] == "only"
+    assert data["changes"][0]["before"]["state"] == "put"
+    # An emptied key's after verdict is null, which is not a "deleted" state.
+    assert data["changes"][0]["after"] is None
+
+
+def test_withdraw_preview_follows_clock_components_on_other_replicas():
+    # r1/1 (k1); r2/1 depends on r1/1 (k2); r1/2 depends on r2/1 and its own
+    # previous event (k3): withdrawing r1/1 must pull all three out.
+    seed = [
+        ev("r1", 1, "k1", put="a", clock={"r1": 1, "r2": 0}),
+        ev("r2", 1, "k2", put="b", clock={"r1": 1, "r2": 1}),
+        ev("r1", 2, "k3", delete="delete", clock={"r1": 2, "r2": 1}),
+    ]
+    hid = hist_create(["r1", "r2"], seed).json()["id"]
+
+    data = hist_withdraw(hid, "r1", 1).json()
+    assert [(d["replica_id"], d["seq"]) for d in data["withdrawn"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r2", 1),
+    ]
+    assert data["events"] == []
+    assert [ch["key"] for ch in data["changes"]] == ["k1", "k2", "k3"]
+    assert all(ch["after"] is None for ch in data["changes"])
+
+
+def test_withdraw_preview_does_not_mutate_the_stored_history():
+    before_events = [
+        ev("r2", 1, "a", put="y", clock={"r1": 1, "r2": 1}),
+        ev("r1", 1, "a", put="x", clock={"r1": 1, "r2": 0}),
+    ]
+    hid = hist_create(["r1", "r2"], before_events).json()["id"]
+    before = hist_get(hid).json()
+
+    preview = hist_withdraw(hid, "r1", 1)
+    assert preview.status_code == 200
+    # Repeated previews are identical...
+    assert hist_withdraw(hid, "r1", 1).json() == preview.json()
+    # ...and the committed history is byte-for-byte unchanged.
+    after = hist_get(hid).json()
+    assert after == before
+    assert len(after["events"]) == 2
+
+
+def test_withdraw_preview_unknown_history_and_missing_event_are_404():
+    r = client.get(
+        f"/api/histories/{'0' * 32}/withdraw-preview",
+        params={"replica_id": "r1", "seq": 1},
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="v", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+
+    # Existing history, seq never used on that replica.
+    r = hist_withdraw(hid, "r1", 2)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+    # replica_id outside the history's replica set is an unknown event, not
+    # a 422: the parameters themselves are well-formed strings.
+    r = hist_withdraw(hid, "r9", 1)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "event_not_found"
+
+
+def test_withdraw_preview_invalid_params_are_422():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="v", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+
+    # seq below the minimum of 1.
+    r = hist_withdraw(hid, "r1", 0)
+    assert r.status_code == 422, r.text
+
+    # Empty replica_id.
+    r = client.get(
+        f"/api/histories/{hid}/withdraw-preview",
+        params={"replica_id": "", "seq": 1},
+    )
+    assert r.status_code == 422, r.text
+
+    # Missing seq.
+    r = client.get(
+        f"/api/histories/{hid}/withdraw-preview",
+        params={"replica_id": "r1"},
+    )
+    assert r.status_code == 422, r.text
+
+    # Non-integer seq.
+    r = client.get(
+        f"/api/histories/{hid}/withdraw-preview",
+        params={"replica_id": "r1", "seq": "x"},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_withdraw_preview_works_after_merge_and_conflict_commit():
+    # The preview reads the same committed history the mutating endpoints
+    # write; a resolution event causally dominates both conflict branches.
+    hid = create_conflict_history()
+    assert (
+        hist_commit(
+            hid,
+            key="name",
+            writer="r1",
+            versions=[
+                {"replica_id": "r1", "seq": 1},
+                {"replica_id": "r2", "seq": 1},
+            ],
+            put="chosen",
+        ).status_code
+        == 200
+    )
+
+    # Withdrawing r1/1 pulls the committed r1/2 resolution (whose previous
+    # event is r1/1), but r2/1 is a *concurrent* branch (its clock has
+    # r1 = 0) and therefore stays; the key reverts to r2's put.
+    data = hist_withdraw(hid, "r1", 1).json()
+    assert [(d["replica_id"], d["seq"]) for d in data["withdrawn"]] == [
+        ("r1", 1),
+        ("r1", 2),
+    ]
+    assert data["events"] == [
+        ev("r2", 1, "name", put="bob", clock={"r1": 0, "r2": 1})
+    ]
+    change = data["changes"][0]
+    assert change["before"]["state"] == "put"
+    assert change["before"]["value"] == "chosen"
+    assert change["after"] == {
+        "key": "name",
+        "state": "put",
+        "value": "bob",
+        "event": {
+            "replica_id": "r2",
+            "seq": 1,
+            "op": "put",
+            "value": "bob",
+            "clock": {"r1": 0, "r2": 1},
+        },
+    }

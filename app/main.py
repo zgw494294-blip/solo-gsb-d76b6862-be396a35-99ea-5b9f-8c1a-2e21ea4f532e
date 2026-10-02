@@ -28,6 +28,15 @@ by ID with only the original resolution parameters (key, writer, versions,
 op) -- the stored versions are re-checked at commit time and stale lists get
 409.  Histories live in a local SQLite database (HISTORY_DB_PATH, WAL) and
 therefore survive container restarts.
+
+A read-only withdrawal-preview endpoint
+(/api/histories/{id}/withdraw-preview) rehearses, on one committed history,
+which events and key verdicts withdrawing a single offline event would
+affect: the target and everything that directly or transitively depends on
+it (across keys) are reported as withdrawn, causally unrelated concurrent
+events remain, and every changed key is shown with its before/after verdict
+(null after when the key empties).  It never modifies the stored history,
+renumbers seqs or rewrites clocks.
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ import json
 import uuid
 from typing import Annotated, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
@@ -247,6 +256,15 @@ class HistoryNotFound(Exception):
     def __init__(self, history_id: str):
         super().__init__(f"history {history_id!r} not found")
         self.history_id = history_id
+
+
+class EventNotFound(Exception):
+    """A history exists but it has no event with that replica_id/seq (404)."""
+
+    def __init__(self, replica_id: str, seq: int):
+        super().__init__(f"event ({replica_id!r}, {seq}) not found")
+        self.replica_id = replica_id
+        self.seq = seq
 
 
 def _err(code: str, message: str, event_index: int | None = None) -> dict:
@@ -665,6 +683,101 @@ def resolve(events: list[Event], replica_ids: list[str]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Read-only withdrawal preview
+# ---------------------------------------------------------------------------
+
+
+def _direct_dependencies(
+    ev: Event, replica_ids: list[str]
+) -> set[tuple[str, int]]:
+    """Events an event causally builds on: the previous event on its own
+    replica and, for every other replica, the event its clock component
+    points at (non-zero components only).  Stored histories have passed
+    batch validation, so every referenced identity exists."""
+
+    deps: set[tuple[str, int]] = set()
+    if ev.seq > 1:
+        deps.add((ev.replica_id, ev.seq - 1))
+    for rid in replica_ids:
+        if rid == ev.replica_id:
+            continue
+        n = ev.clock[rid]
+        if n > 0:
+            deps.add((rid, n))
+    return deps
+
+
+def preview_withdrawal(
+    replica_ids: list[str],
+    events: list[Event],
+    target_replica: str,
+    target_seq: int,
+) -> dict:
+    """Pure, non-mutating projection of what withdrawing one event would take.
+
+    The withdrawn set is the target event plus every event that directly or
+    transitively depends on it (its reverse reachability under the same
+    dependency edges used by batch validation: each replica's previous event
+    and the events other replicas' non-zero clock components point at).  All
+    other events, including causally unrelated concurrent writes, are kept.
+
+    Returns the withdrawn identities (sorted by replica_id then seq), the
+    kept events in the original canonical order (same order, seqs and clocks
+    -- nothing is renumbered), and the before/after verdict of every key
+    whose full verdict structure would change (sorted by key); a key with no
+    remaining event reports an ``after`` verdict of ``None``.
+    """
+
+    seen = {(ev.replica_id, ev.seq): ev for ev in events}
+    if (target_replica, target_seq) not in seen:
+        raise EventNotFound(target_replica, target_seq)
+
+    # Reverse dependency graph: identity -> events that directly depend on it.
+    dependents: dict[tuple[str, int], set[tuple[str, int]]] = {}
+    for ev in events:
+        for dep in _direct_dependencies(ev, replica_ids):
+            dependents.setdefault(dep, set()).add((ev.replica_id, ev.seq))
+
+    # Reverse reachability from the target = target plus its transitive
+    # dependents, i.e. everything that would have to be withdrawn with it.
+    withdrawn: set[tuple[str, int]] = set()
+    frontier = [(target_replica, target_seq)]
+    while frontier:
+        ident = frontier.pop()
+        if ident in withdrawn:
+            continue
+        withdrawn.add(ident)
+        frontier.extend(dependents.get(ident, ()))
+
+    ordered = sorted(events, key=lambda e: (e.replica_id, e.seq))
+    kept = [ev for ev in ordered if (ev.replica_id, ev.seq) not in withdrawn]
+
+    before_by_key = {v["key"]: v for v in resolve(ordered, replica_ids)}
+    after_by_key = {v["key"]: v for v in resolve(kept, replica_ids)}
+    touched_keys = {
+        ev.key for ev in ordered if (ev.replica_id, ev.seq) in withdrawn
+    }
+
+    changes: list[dict] = []
+    for key in sorted(touched_keys):
+        before = before_by_key[key]
+        after = after_by_key.get(key)
+        # Compare the complete verdict structures (put/deleted/conflict
+        # shapes differ as a whole), not just a state/value subset.
+        if before != after:
+            changes.append({"key": key, "before": before, "after": after})
+
+    withdrawn_ids = sorted(withdrawn)
+    return {
+        "withdrawn": [
+            {"replica_id": rid, "seq": seq} for rid, seq in withdrawn_ids
+        ],
+        "events": [_canonical_wire(ev, replica_ids) for ev in kept],
+        "changes": changes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Conflict resolution event
 # ---------------------------------------------------------------------------
 
@@ -1046,6 +1159,26 @@ async def history_not_found_handler(
     )
 
 
+@app.exception_handler(EventNotFound)
+async def event_not_found_handler(
+    request: Request, exc: EventNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "event_not_found",
+                    "message": (
+                        f"this history has no event with replica_id "
+                        f"{exc.replica_id!r} and seq {exc.seq}"
+                    ),
+                }
+            ]
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
@@ -1151,6 +1284,50 @@ def read_history(history_id: str) -> dict:
         raise HistoryNotFound(history_id)
     hid, replica_ids, events = _load_row(row)
     return _history_state(hid, replica_ids, events)
+
+
+@app.get(
+    "/api/histories/{history_id}/withdraw-preview",
+    tags=["histories"],
+    response_model=None,
+)
+def preview_history_event_withdrawal(
+    history_id: str,
+    replica_id: Annotated[
+        str,
+        Query(
+            min_length=1,
+            description="Replica ID of the event whose withdrawal is previewed.",
+        ),
+    ],
+    seq: Annotated[
+        int,
+        Query(
+            ge=1,
+            description="Per-replica seq of the event whose withdrawal is previewed.",
+        ),
+    ],
+) -> dict:
+    """Preview withdrawing one offline event without touching the history.
+
+    Read-only: the stored history is fetched as one committed snapshot and
+    never written back.  The previewed withdrawal removes the target event
+    plus every event that directly or transitively depends on it (following
+    each replica's previous event and other replicas' non-zero clock
+    components), across every key; unrelated concurrent events are kept with
+    their original seqs and clocks.  The response lists the withdrawn
+    identities, the remaining events in original wire order, and the
+    before/after verdict of every changed key (``after`` is null when the key
+    has no remaining event).  Unknown history/event -> 404; invalid params
+    (missing/non-integer/non-positive) -> 422.
+    """
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    hid, replica_ids, events = _load_row(row)
+    preview = preview_withdrawal(replica_ids, events, replica_id, seq)
+    return {"id": hid, **preview}
 
 
 @app.post(
